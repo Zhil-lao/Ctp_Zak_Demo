@@ -1,4 +1,4 @@
-#include <iostream>
+﻿#include <iostream>
 #include <iomanip>
 #include <windows.h>
 #include <time.h>
@@ -25,6 +25,13 @@ extern TThostFtdcAuthCodeType AuthCode;						  // 授权码
 TThostFtdcFrontIDType	trade_front_id;		//前置编号
 TThostFtdcSessionIDType	session_id;		    //会话编号
 TThostFtdcOrderRefType	order_ref;			//报单引用
+
+// ---- Bench: OrderRef 匹配（定义在 main.cpp）---- //
+#define MAX_BENCH 10000
+extern char g_benRefs[MAX_BENCH][13];
+extern volatile int g_benRefCnt;
+extern volatile char g_benDone[MAX_BENCH];
+extern volatile int g_benOk;
 
 // 方案 A: 处理 std::string 或可隐式转换为 std::string 的类型
 void printField(const std::string& label, const std::string& value) {
@@ -97,11 +104,6 @@ void RealTradeSpi::OnRspUserLogin(CThostFtdcRspUserLoginField* pRspUserLogin, CT
 
 void RealTradeSpi::OnRspError(CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast)
 {
-	if (benchRunning) {
-		benchRspErr++;
-		benchInFlight--;
-		sendNextBenchOrder(g_pTradeInstrumentID, gLimitPrice, 1);
-	}
 	isErrorRspInfo(pRspInfo);
 }
 
@@ -218,38 +220,20 @@ void RealTradeSpi::OnRspQryInvestorPosition(CThostFtdcInvestorPositionField* pIn
 		else
 			std::cout << "----->该合约未持仓" << std::endl;
 
-		// 报单录入请求（这里是一部接口，此处是按顺序执行）
-		/*if (loginFlag)
-			reqOrderInsert();*/
-			//if (loginFlag)
-			//	buy_open(); // 自定义一笔交易
-
-			// 策略交易
-		std::cout << "=====开始进入策略交易=====" << std::endl;
-		// 需要注意bIsLast的值，CTP的查询接口是分批返回的，只有当bIsLast为true时才表示查询结束，此时才可以进行下一步的交易操作，否则导致重复下单
-		if (loginFlag && bIsLast)
-			runBenchmark(60, g_pTradeInstrumentID, gLimitPrice, 1);
-
-		//while (loginFlag) {
-		//	StrategyCheckAndTrade(g_pTradeInstrumentID, this);  // 调用策略
-		//}
-			
+		//std::cout << "=====开始进入策略交易=====" << std::endl;
+		//// 需要注意bIsLast的值，CTP的查询接口是分批返回的，只有当bIsLast为true时才表示查询结束，此时才可以进行下一步的交易操作，否则导致重复下单
+		//if (loginFlag && bIsLast)
+		//	// FAK order: limit price + IOC + AV (fill-or-kill, avoid accumulating positions)
+		//	int rt = sendBenchOrder(g_pTradeInstrumentID, gLimitPrice, 1,
+		//		THOST_FTDC_D_Buy,
+		//		THOST_FTDC_OPT_LimitPrice,
+		//		THOST_FTDC_TC_IOC,
+		//		THOST_FTDC_VC_AV);
 	}
 }
 
 void RealTradeSpi::OnRspOrderInsert(CThostFtdcInputOrderField* pInputOrder, CThostFtdcRspInfoField* pRspInfo, int nRequestID, bool bIsLast)
 {
-	if (benchRunning) {
-		benchInFlight--;
-		if (!isErrorRspInfo(pRspInfo)) {
-			benchRspOk++;
-		} else {
-			benchRspErr++;
-		}
-		sendNextBenchOrder(g_pTradeInstrumentID, gLimitPrice, 1);
-		return;
-	}
-
 	if (!isErrorRspInfo(pRspInfo))
 	{
 		std::cout << "=====报单录入成功=====" << std::endl;
@@ -272,44 +256,46 @@ void RealTradeSpi::OnRspOrderAction(CThostFtdcInputOrderActionField* pInputOrder
 
 void RealTradeSpi::OnRtnOrder(CThostFtdcOrderField* pOrder)
 {
-	if (benchRunning) {
-		benchRtnOrderCount++;
-		sendNextBenchOrder(g_pTradeInstrumentID, gLimitPrice, 1);
-		return;
+	// ---- Bench: 匹配 OrderRef，只统计首次非 Unknown 状态 ---- //
+	for (int i = 0; i < g_benRefCnt; i++) {
+		if ((pOrder->FrontID == trade_front_id) &&
+			(pOrder->SessionID == session_id) &&
+			(strcmp(pOrder->OrderRef, g_benRefs[i]) == 0)) {
+			if (!g_benDone[i] && pOrder->OrderStatus != THOST_FTDC_OST_Unknown) {
+				g_benDone[i] = 1;
+				g_benOk++;
+			}
+			return;
+		}
 	}
 
-	char str[10];
-	sprintf(str, "%d", pOrder->OrderSubmitStatus);
-	int orderState = atoi(str) - 48;	//报单状态0=已经提交，3=已经接受
+	// char str[10];
+	// sprintf(str, "%d", pOrder->OrderSubmitStatus);
+	// int orderState = atoi(str) - 48;	//报单状态0=已经提交，3=已经接受
 
-	std::cout << "=====收到报单应答=====" << std::endl;
+	// std::cout << "=====收到报单应答=====" << std::endl;
 
-	if (isMyOrder(pOrder))
-	{
-		if (pOrder->OrderStatus == THOST_FTDC_OST_AllTraded) {
-			std::cout << "--->>> 成交！" << std::endl;
-		}
-		if (pOrder->OrderStatus == THOST_FTDC_OST_PartTradedQueueing) {
-			std::cout << "--->>> 部分成交！" << std::endl;
-			reqOrderAction(pOrder); // 这里可以撤单
-			reqUserLogout(); // 登出测试
-		}
-		if (isTradingOrder(pOrder))
-		{
-			std::cout << "--->>> 等待成交中！" << std::endl;
-		}
-		else if (pOrder->OrderStatus == THOST_FTDC_OST_Canceled)
-			std::cout << pOrder->StatusMsg << std::endl;
-	}
+	// if (isMyOrder(pOrder))
+	// {
+	// 	if (pOrder->OrderStatus == THOST_FTDC_OST_AllTraded) {
+	// 		std::cout << "--->>> 成交！" << std::endl;
+	// 	}
+	// 	if (pOrder->OrderStatus == THOST_FTDC_OST_PartTradedQueueing) {
+	// 		std::cout << "--->>> 部分成交！" << std::endl;
+	// 		reqOrderAction(pOrder); // 这里可以撤单
+	// 		reqUserLogout(); // 登出测试
+	// 	}
+	// 	if (isTradingOrder(pOrder))
+	// 	{
+	// 		std::cout << "--->>> 等待成交中！" << std::endl;
+	// 	}
+	// 	else if (pOrder->OrderStatus == THOST_FTDC_OST_Canceled)
+	// 		std::cout << pOrder->StatusMsg << std::endl;
+	// }
 }
 
 void RealTradeSpi::OnRtnTrade(CThostFtdcTradeField* pTrade)
 {
-	if (benchRunning) {
-		benchRtnTradeCount++;
-		return;
-	}
-
 	std::cout << "=====报单成功成交=====" << std::endl;
 	std::cout << "成交时间： " << pTrade->TradeTime << std::endl;
 	std::cout << "合约代码： " << pTrade->InstrumentID << std::endl;
@@ -420,10 +406,6 @@ void RealTradeSpi::reqQueryInvestorPosition()
 		std::cerr << "--->>>发送投资者持仓查询请求失败" << std::endl;
 }
 
-static void setOrderRef(int ref) {
-	sprintf(order_ref, "%d", ref);
-}
-
 static int sendBenchOrder(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType price, TThostFtdcVolumeType volume, char direction, char orderPriceType, char timeCondition, char volumeCondition)
 {
 	CThostFtdcInputOrderField orderInsertReq;
@@ -437,6 +419,7 @@ static int sendBenchOrder(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPri
 	orderInsertReq.CombOffsetFlag[0] = THOST_FTDC_OF_Open;
 	orderInsertReq.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
 	orderInsertReq.LimitPrice = price;
+	orderInsertReq.IsSwapOrder = 0;
 	orderInsertReq.VolumeTotalOriginal = volume;
 	orderInsertReq.TimeCondition = timeCondition;
 	orderInsertReq.VolumeCondition = volumeCondition;
@@ -448,199 +431,6 @@ static int sendBenchOrder(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPri
 	static int requestID = 0;
 	return g_pTradeUserApi->ReqOrderInsert(&orderInsertReq, ++requestID);
 }
-
-// 买开仓
-void RealTradeSpi::buy_open(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType NewPrice, TThostFtdcVolumeType volume)
-{
-	CThostFtdcInputOrderField orderInsertReq;
-	memset(&orderInsertReq, 0, sizeof(orderInsertReq));
-	///经纪公司代码
-	strcpy(orderInsertReq.BrokerID, gBrokerID);
-	///投资者代码
-	strcpy(orderInsertReq.InvestorID, gInvesterID);
-	///合约代码
-	strcpy(orderInsertReq.InstrumentID, instrumentID);
-	///报单引用
-	strcpy(orderInsertReq.OrderRef, order_ref);
-	///报单价格条件: 限价
-	orderInsertReq.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
-	///买卖方向: 
-	orderInsertReq.Direction = THOST_FTDC_D_Buy;
-	///组合开平标志: 开仓、平仓等
-	orderInsertReq.CombOffsetFlag[0] = THOST_FTDC_OF_Open;
-	///组合投机套保标志
-	orderInsertReq.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
-	orderInsertReq.IsSwapOrder = 0;
-	///价格
-	orderInsertReq.LimitPrice = NewPrice;
-	///数量：1
-	orderInsertReq.VolumeTotalOriginal = volume;
-	///有效期类型: 当日有效
-	orderInsertReq.TimeCondition = THOST_FTDC_TC_IOC;
-	///成交量类型: 任何数量
-	orderInsertReq.VolumeCondition = THOST_FTDC_VC_CV;
-	///最小成交量: 1
-	orderInsertReq.MinVolume = 1;
-	///触发条件: 立即
-	orderInsertReq.ContingentCondition = THOST_FTDC_CC_Immediately;
-	///强平原因: 非强平
-	orderInsertReq.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
-	///自动挂起标志: 否
-	//orderInsertReq.IsAutoSuspend = 0;
-	///用户强评标志: 否
-	//orderInsertReq.UserForceClose = 0;
-	static int requestID = 0;
-	int rt = g_pTradeUserApi->ReqOrderInsert(&orderInsertReq, ++requestID);
-	if (!rt)
-		std::cout << ">>>>>>发送买开仓报单录入请求成功" << std::endl;
-	else
-		std::cerr << "--->>>发送买开仓报单录入请求失败" << std::endl;
-}
-//
-//// 买平仓
-//void RealTradeSpi::buy_close(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType NewPrice, TThostFtdcVolumeType volume, TThostFtdcTimeConditionType CombOffsetFlag)
-//{
-//	CThostFtdcInputOrderField orderInsertReq;
-//	memset(&orderInsertReq, 0, sizeof(orderInsertReq));
-//	///经纪公司代码
-//	strcpy(orderInsertReq.BrokerID, gBrokerID);
-//	///投资者代码
-//	strcpy(orderInsertReq.InvestorID, gInvesterID);
-//	///合约代码
-//	strcpy(orderInsertReq.InstrumentID, instrumentID);
-//	///报单引用
-//	strcpy(orderInsertReq.OrderRef, order_ref);
-//	///报单价格条件: 限价
-//	orderInsertReq.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
-//	///买卖方向: 
-//	orderInsertReq.Direction = THOST_FTDC_D_Buy;
-//	///组合开平标志: 开仓、平仓等
-//	orderInsertReq.CombOffsetFlag[0] = CombOffsetFlag;
-//	///组合投机套保标志
-//	orderInsertReq.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
-//	///价格
-//	orderInsertReq.LimitPrice = NewPrice;
-//	///数量：1
-//	orderInsertReq.VolumeTotalOriginal = volume;
-//	///有效期类型: 当日有效
-//	orderInsertReq.TimeCondition = THOST_FTDC_TC_GFD;
-//	///成交量类型: 任何数量
-//	orderInsertReq.VolumeCondition = THOST_FTDC_VC_AV;
-//	///最小成交量: 1
-//	orderInsertReq.MinVolume = 1;
-//	///触发条件: 立即
-//	orderInsertReq.ContingentCondition = THOST_FTDC_CC_Immediately;
-//	///强平原因: 非强平
-//	orderInsertReq.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
-//	///自动挂起标志: 否
-//	orderInsertReq.IsAutoSuspend = 0;
-//	///用户强评标志: 否
-//	orderInsertReq.UserForceClose = 0;
-//
-//	static int requestID = 0; // 请求编号
-//	int rt = g_pTradeUserApi->ReqOrderInsert(&orderInsertReq, ++requestID);
-//	if (!rt)
-//		std::cout << ">>>>>>发送买平仓报单录入请求成功" << std::endl;
-//	else
-//		std::cerr << "--->>>发送买平仓报单录入请求失败" << std::endl;
-//}
-//
-// 卖开仓
-void RealTradeSpi::sell_open(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType NewPrice, TThostFtdcVolumeType volume)
-{
-	CThostFtdcInputOrderField orderInsertReq;
-	memset(&orderInsertReq, 0, sizeof(orderInsertReq));
-	///经纪公司代码
-	strcpy(orderInsertReq.BrokerID, gBrokerID);
-	///投资者代码
-	strcpy(orderInsertReq.InvestorID, gInvesterID);
-	///合约代码
-	strcpy(orderInsertReq.InstrumentID, instrumentID);
-	///报单引用
-	strcpy(orderInsertReq.OrderRef, order_ref);
-	///报单价格条件: 限价
-	orderInsertReq.OrderPriceType = THOST_FTDC_OPT_AnyPrice;
-	///买卖方向: 
-	orderInsertReq.Direction = THOST_FTDC_D_Sell;
-	///组合开平标志: 开仓、平仓等
-	orderInsertReq.CombOffsetFlag[0] = THOST_FTDC_OF_Open;
-	orderInsertReq.IsSwapOrder = 0;
-	///组合投机套保标志
-	orderInsertReq.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
-	///价格
-	orderInsertReq.LimitPrice = 0;
-	///数量：1
-	orderInsertReq.VolumeTotalOriginal = volume;
-	///有效期类型: 当日有效
-	orderInsertReq.TimeCondition = THOST_FTDC_TC_GFD;
-	///成交量类型: 任何数量
-	orderInsertReq.VolumeCondition = THOST_FTDC_VC_CV;
-	///最小成交量: 1
-	orderInsertReq.MinVolume = 1;
-	///触发条件: 立即
-	orderInsertReq.ContingentCondition = THOST_FTDC_CC_Immediately;
-	///强平原因: 非强平
-	orderInsertReq.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
-	///自动挂起标志: 否
-	//orderInsertReq.IsAutoSuspend = 0;
-	///用户强评标志: 否
-	//orderInsertReq.UserForceClose = 0;
-
-	static int requestID = 0; // 请求编号
-	int rt = g_pTradeUserApi->ReqOrderInsert(&orderInsertReq, ++requestID);
-	if (!rt)
-		std::cout << ">>>>>>发送卖开仓报单录入请求成功" << std::endl;
-	else
-		std::cerr << "--->>>发送卖开仓报单录入请求失败" << std::endl;
-}
-//
-//// 卖平仓
-//void RealTradeSpi::sell_close(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType NewPrice, TThostFtdcVolumeType volume, TThostFtdcTimeConditionType CombOffsetFlag)
-//{
-//	CThostFtdcInputOrderField orderInsertReq;
-//	memset(&orderInsertReq, 0, sizeof(orderInsertReq));
-//	///经纪公司代码
-//	strcpy(orderInsertReq.BrokerID, gBrokerID);
-//	///投资者代码
-//	strcpy(orderInsertReq.InvestorID, gInvesterID);
-//	///合约代码
-//	strcpy(orderInsertReq.InstrumentID, instrumentID);
-//	///报单引用
-//	strcpy(orderInsertReq.OrderRef, order_ref);
-//	///报单价格条件: 限价
-//	orderInsertReq.OrderPriceType = THOST_FTDC_OPT_LimitPrice;
-//	///买卖方向: 
-//	orderInsertReq.Direction = THOST_FTDC_D_Sell;
-//	///组合开平标志: 开仓、平仓等
-//	orderInsertReq.CombOffsetFlag[0] = CombOffsetFlag;
-//	///组合投机套保标志
-//	orderInsertReq.CombHedgeFlag[0] = THOST_FTDC_HF_Speculation;
-//	///价格
-//	orderInsertReq.LimitPrice = NewPrice;
-//	///数量：1
-//	orderInsertReq.VolumeTotalOriginal = volume;
-//	///有效期类型: 当日有效
-//	orderInsertReq.TimeCondition = THOST_FTDC_TC_GFD;
-//	///成交量类型: 任何数量
-//	orderInsertReq.VolumeCondition = THOST_FTDC_VC_AV;
-//	///最小成交量: 1
-//	orderInsertReq.MinVolume = 1;
-//	///触发条件: 立即
-//	orderInsertReq.ContingentCondition = THOST_FTDC_CC_Immediately;
-//	///强平原因: 非强平
-//	orderInsertReq.ForceCloseReason = THOST_FTDC_FCC_NotForceClose;
-//	///自动挂起标志: 否
-//	orderInsertReq.IsAutoSuspend = 0;
-//	///用户强评标志: 否
-//	orderInsertReq.UserForceClose = 0;
-//
-//	static int requestID = 0; // 请求编号
-//	int rt = g_pTradeUserApi->ReqOrderInsert(&orderInsertReq, ++requestID);
-//	if (!rt)
-//		std::cout << ">>>>>>发送卖平仓报单录入请求成功" << std::endl;
-//	else
-//		std::cerr << "--->>>发送卖平仓报单录入请求失败" << std::endl;
-//}
 
 // 请求报单操作
 void RealTradeSpi::reqOrderAction(CThostFtdcOrderField* pOrder)
@@ -702,93 +492,4 @@ bool RealTradeSpi::isTradingOrder(CThostFtdcOrderField* pOrder)
 	return ((pOrder->OrderStatus != THOST_FTDC_OST_PartTradedNotQueueing) &&
 		(pOrder->OrderStatus != THOST_FTDC_OST_Canceled) &&
 		(pOrder->OrderStatus != THOST_FTDC_OST_AllTraded));
-}
-
-// ======================== Benchmark ========================
-
-void RealTradeSpi::runBenchmark(int durationSeconds, TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType price, TThostFtdcVolumeType volume)
-{
-	benchNextOrderRef = atoi(order_ref) + 1;
-	benchSent = 0;
-	benchRspOk = 0;
-	benchRspErr = 0;
-	benchFlowCtrl = 0;
-	benchInFlight = 0;
-	benchMaxInFlight = 0;
-	benchRtnOrderCount = 0;
-	benchRtnTradeCount = 0;
-	benchDurationSeconds = durationSeconds;
-	benchRunning = true;
-	benchStartTime = std::chrono::steady_clock::now();
-
-	std::cout << "\n========== Benchmark Start ==========" << std::endl;
-	std::cout << "Instrument: " << instrumentID << "  Price: " << price << "  Volume: " << volume << std::endl;
-	std::cout << "Duration: " << durationSeconds << " seconds" << std::endl;
-	std::cout << "Start OrderRef: " << benchNextOrderRef << std::endl;
-	std::cout << "=====================================\n" << std::endl;
-
-	// Send initial batch to fill the pipeline
-	for (int i = 0; i < 200 && benchRunning; i++) {
-		int before = benchFlowCtrl;
-		sendNextBenchOrder(instrumentID, price, volume);
-		if (benchFlowCtrl > before) break;
-	}
-}
-
-void RealTradeSpi::sendNextBenchOrder(TThostFtdcInstrumentIDType instrumentID, TThostFtdcPriceType price, TThostFtdcVolumeType volume)
-{
-	if (!benchRunning)
-		return;
-
-	// Check timeout
-	auto now = std::chrono::steady_clock::now();
-	auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - benchStartTime).count();
-	if (elapsed >= benchDurationSeconds) {
-		benchRunning = false;
-		printBenchmarkResult();
-		return;
-	}
-
-	// Generate unique OrderRef
-	setOrderRef(benchNextOrderRef++);
-
-	// FAK order: limit price + IOC + AV (fill-or-kill, avoid accumulating positions)
-	int rt = sendBenchOrder(instrumentID, price, volume,
-		THOST_FTDC_D_Buy,
-		THOST_FTDC_OPT_LimitPrice,
-		THOST_FTDC_TC_IOC,
-		THOST_FTDC_VC_AV);
-
-	benchSent++;
-
-	if (rt != 0) {
-		benchFlowCtrl++;
-	} else {
-		benchInFlight++;
-		if (benchInFlight > benchMaxInFlight)
-			benchMaxInFlight = benchInFlight;
-	}
-}
-
-void RealTradeSpi::printBenchmarkResult()
-{
-	auto now = std::chrono::steady_clock::now();
-	auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - benchStartTime).count();
-	double elapsedSec = elapsedMs / 1000.0;
-
-	std::cout << "\n========== Benchmark Result ==========" << std::endl;
-	std::cout << "Actual duration:     " << elapsedSec << " s" << std::endl;
-	std::cout << "Total sent:          " << benchSent << std::endl;
-	std::cout << "Flow control reject: " << benchFlowCtrl << std::endl;
-	std::cout << "Rsp OK:              " << benchRspOk << std::endl;
-	std::cout << "Rsp Error:           " << benchRspErr << std::endl;
-	std::cout << "RtnOrder count:      " << benchRtnOrderCount << std::endl;
-	std::cout << "RtnTrade count:      " << benchRtnTradeCount << std::endl;
-	std::cout << "Max in-flight:       " << benchMaxInFlight << std::endl;
-	std::cout << "--------------------------------------" << std::endl;
-	if (elapsedSec > 0) {
-		std::cout << "Send rate:           " << (benchSent / elapsedSec) << " orders/s" << std::endl;
-		std::cout << "Rsp OK rate:         " << (benchRspOk / elapsedSec) << " orders/s" << std::endl;
-	}
-	std::cout << "======================================\n" << std::endl;
 }
